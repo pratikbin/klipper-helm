@@ -81,10 +81,87 @@ helm_update() {
 	${HELM} "$@" ${NAME_ARG} ${NAME} "${CHART}" ${CA_FILE_ARG} ${INSECURE_TLS_ARG} ${PLAIN_HTTP_ARG} ${TIMEOUT_ARG} ${VALUES}
 }
 
+helm_oci_login() {
+	# Extract registry from OCI URL (e.g., oci://registry.example.com/chart:version -> registry.example.com)
+	local oci_url="$1"
+	OCI_REGISTRY=$(echo "${oci_url}" | sed -n 's|^oci://\([^/]*\).*|\1|p')
+
+	if [[ -z "${OCI_REGISTRY}" ]]; then
+		return
+	fi
+
+	# Handle OCI registry authentication
+	# Note: --insecure-skip-tls-verify and --plain-http are handled at install/upgrade level, not login
+	if [[ -f "${AUTH_DIR}/username" ]] && [[ -f "${AUTH_DIR}/password" ]]; then
+		echo "Logging into OCI registry ${OCI_REGISTRY}"
+		cat ${AUTH_DIR}/password | ${HELM} registry login --username "$(cat ${AUTH_DIR}/username)" --password-stdin ${OCI_REGISTRY}
+	fi
+}
+
+helm_oci_construct_chart() {
+	# Construct full OCI chart path from REPO and CHART
+	# Handles two scenarios:
+	# 1. repo: oci://registry/path/chart-name (chart name already in repo)
+	# 2. repo: oci://registry/path/ (chart name needs to be appended)
+
+	# We intentionally only use the *basename* of CHART to avoid
+	# accidentally duplicating path segments if CHART already contains
+	# a path like "kata-deploy/kata-deploy".
+	if [[ "${REPO}" =~ ^oci:// ]]; then
+		# Remove oci:// prefix for processing
+		local repo_path="${REPO#oci://}"
+		local chart_base
+
+		chart_base="$(basename "${CHART}")"
+
+		# If repo ends with /, append chart name basename
+		if [[ "${REPO}" =~ /$ ]]; then
+			CHART="oci://${repo_path}${chart_base}"
+		else
+			# If repo doesn't end with /, check if chart basename is already included at the end
+			# Examples that should be treated as "already includes chart":
+			#   ghcr.io/.../kata-deploy
+			#   ghcr.io/.../kata-deploy:3.24.0
+			#   ghcr.io/.../kata-deploy@sha256:...
+			if [[ "${repo_path}" == */"${chart_base}" ]] || \
+			   [[ "${repo_path}" == */"${chart_base}":* ]] || \
+			   [[ "${repo_path}" == */"${chart_base}"@* ]]; then
+				CHART="${REPO}"
+			else
+				CHART="oci://${repo_path}/${chart_base}"
+			fi
+		fi
+
+		# Append version if specified and not already in the chart path
+		if [[ -n "${VERSION}" ]] && [[ ! "${CHART}" =~ :${VERSION}$ ]]; then
+			CHART="${CHART}:${VERSION}"
+		fi
+
+		echo "Constructed OCI chart path: ${CHART}"
+	fi
+}
+
 helm_repo_init() {
 	# if the chart is url skip repo update
 	if grep -q -e "https\?://" <<< "${CHART}"; then
 		echo "chart path is a url, skipping repo update"
+		${HELM} repo remove stable || true
+		return
+	fi
+
+	# if the chart is OCI-based, handle OCI authentication and skip repo update
+	if grep -q -e "^oci://" <<< "${CHART}"; then
+		echo "chart path is OCI-based, skipping repo update"
+		helm_oci_login "${CHART}"
+		${HELM} repo remove stable || true
+		return
+	fi
+
+	# if REPO is OCI-based, construct the full OCI chart path
+	if [[ -n "${REPO}" ]] && [[ "${REPO}" =~ ^oci:// ]]; then
+		echo "repo is OCI-based, constructing OCI chart path"
+		helm_oci_construct_chart
+		helm_oci_login "${CHART}"
 		${HELM} repo remove stable || true
 		return
 	fi
@@ -189,4 +266,3 @@ if [[ "$1" != "delete" ]]; then
 	helm_repo_init
 fi
 helm_update "$@"
-
